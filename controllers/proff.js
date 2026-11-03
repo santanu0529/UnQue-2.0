@@ -1,110 +1,151 @@
-import {HttpError} from "../models/error.js"
-import {Availability} from "../models/availability.js"
+import { HttpError } from "../models/error.js";
+import { Availability } from "../models/availability.js";
 import { Appointment } from "../models/appointment.js";
 import moment from "moment";
 import mongoose from "mongoose";
 
-
-
-// Controller to set availability
+// Add professor availability
 const setAvailability = async (req, res, next) => {
   try {
-    console.log(req.user);  // Log req.user to see if it's coming through
-    
     const { startTime, endTime } = req.body;
-    
-    if (!req.user || !req.user.id) {
-      return next(new HttpError("No professor ID found", 400));
+    const professorId = req.user.id;
+
+    if (!mongoose.Types.ObjectId.isValid(professorId)) {
+      return next(new HttpError("Invalid professor ID", 400));
     }
 
-    // Ensure startTime is before endTime
-    if (new Date(startTime) >= new Date(endTime)) {
-      return next(new HttpError("Start time must be before end time", 400));
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+
+    if (!startTime || !endTime || isNaN(start) || isNaN(end) || start >= end) {
+      return next(new HttpError("Invalid start or end time", 400));
     }
 
-    // Check for overlapping availability
-    const existingAvailability = await Availability.findOne({
-      professorId: req.user.id,
-      $or: [
-        { startTime: { $lt: new Date(endTime) }, endTime: { $gt: new Date(startTime) } }, // Start overlaps
-        { startTime: { $lt: new Date(startTime) }, endTime: { $gt: new Date(endTime) } }  // End overlaps
-      ]
-      // New time starts before an old one finishes
-      // New time finishes after an old one start
+    const overlap = await Availability.findOne({
+      professorId,
+      startTime: { $lt: end },
+      endTime: { $gt: start }
     });
 
-    if (existingAvailability) {
-      return next(new HttpError("This time slot is already added for you professor", 400));
+    if (overlap) {
+      return next(new HttpError("This availability overlaps an existing slot", 400));
     }
 
-    // Create new availability entry
-    const availability = new Availability({
-      professorId: req.user.id,  // Ensure that professorId is coming from req.user._id
-      startTime,
-      endTime,
+    const availability = await Availability.create({
+      professorId,
+      startTime: start,
+      endTime: end
     });
-
-    await availability.save();
-
-    const formattedStartTime = moment.utc(availability.startTime).format('MMMM Do YYYY, h:mm:ss a');
-    const formattedEndTime = moment.utc(availability.endTime).format('MMMM Do YYYY, h:mm:ss a');
 
     res.status(201).json({
       message: "Availability added successfully",
-      availability: {
-        ...availability.toObject(),  // Spreading existing availability data
-        startTime: formattedStartTime, // Replacing with formatted date
-        endTime: formattedEndTime, // Replacing  with formatted date
-      },
+      availability
     });
   } catch (error) {
-    console.log(error);  // Log error for better debugging
+    console.error(error);
     return next(new HttpError("Adding availability failed", 500));
   }
 };
 
+// Update an existing free availability slot
+const updateAvailability = async (req, res, next) => {
+  try {
+    const { availabilityId } = req.params;
+    const { startTime, endTime } = req.body;
+    const professorId = req.user.id;
 
-
-  const cancelAppointments = async(req,res,next) => {
-    try {
-      const { studentId } = req.params;  // Student's ID from params
-      const professorId = req.user.id;   // Professor's ID from the authenticated user
-      console.log('Professor ID:', professorId);  // This should match the professor's ID in the appointment
-      console.log('Student ID:', studentId);
-
-      // Ensuring professor is authenticated and studentId is provided
-      if (!studentId || !mongoose.Types.ObjectId.isValid(studentId)) {
-        return next(new HttpError("Invalid or missing student ID", 400));
-      }
-  
-      // Finding the  appointments between this professor and student
-      const appointments = await Appointment.find({
-        studentId: new mongoose.Types.ObjectId(studentId),
-        professorId: new mongoose.Types.ObjectId(professorId),
-        status: 'booked' // Only cancel booked appointments
-      });
-  
-      if (!appointments || appointments.length === 0) {
-        return next(new HttpError("No appointments found to cancel", 404));
-      }
-  
-      // Updating the status of all appointments to "canceled"
-      await Appointment.updateMany(
-        {
-          studentId: new mongoose.Types.ObjectId(studentId),
-          professorId: new mongoose.Types.ObjectId(professorId),
-          status: 'booked'
-        },
-        { status: 'canceled' }  //  the status  needs to be canceled
-      );
-  
-      res.status(200).json({
-        message: `All appointments between professor ${professorId} and student ${studentId} have been canceled.,`
-      });
-  
-    } catch (error) {
-      console.error("Error cancelling appointments:", error);
-      return next(new HttpError(error));
+    if (!mongoose.Types.ObjectId.isValid(availabilityId)) {
+      return next(new HttpError("Invalid availability ID", 400));
     }
-  };
-export {setAvailability, cancelAppointments};
+
+    if (!startTime || !endTime) {
+      return next(new HttpError("Start time and end time are required", 400));
+    }
+
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+
+    if (isNaN(start) || isNaN(end) || start >= end) {
+      return next(new HttpError("Invalid start or end time", 400));
+    }
+
+    const slot = await Availability.findOne({
+      _id: availabilityId,
+      professorId
+    });
+
+    if (!slot) {
+      return next(new HttpError("Availability slot not found", 404));
+    }
+
+    // Do not update a slot if it contains an existing appointment
+    const bookedAppointment = await Appointment.findOne({
+      professorId,
+      time: { $gte: slot.startTime, $lt: slot.endTime },
+      status: "booked"
+    });
+
+    if (bookedAppointment) {
+      return next(new HttpError("Cannot update a slot that has a booked appointment", 400));
+    }
+
+    // Check overlap with other availability slots
+    const overlap = await Availability.findOne({
+      professorId,
+      _id: { $ne: availabilityId },
+      startTime: { $lt: end },
+      endTime: { $gt: start }
+    });
+
+    if (overlap) {
+      return next(new HttpError("Updated time overlaps another availability slot", 400));
+    }
+
+    slot.startTime = start;
+    slot.endTime = end;
+    await slot.save();
+
+    res.status(200).json({
+      message: "Availability updated successfully",
+      availability: slot
+    });
+  } catch (error) {
+    console.error(error);
+    return next(new HttpError("Updating availability failed", 500));
+  }
+};
+
+// Cancel appointments between a professor and student
+const cancelAppointments = async (req, res, next) => {
+  try {
+    const { studentId } = req.params;
+    const professorId = req.user.id;
+
+    if (!studentId || !mongoose.Types.ObjectId.isValid(studentId)) {
+      return next(new HttpError("Invalid or missing student ID", 400));
+    }
+
+    const result = await Appointment.updateMany(
+      {
+        studentId,
+        professorId,
+        status: "booked"
+      },
+      { $set: { status: "cancelled" } }
+    );
+
+    if (result.modifiedCount === 0) {
+      return next(new HttpError("No appointments found to cancel", 404));
+    }
+
+    res.status(200).json({
+      message: "Appointments cancelled successfully",
+      cancelledCount: result.modifiedCount
+    });
+  } catch (error) {
+    console.error(error);
+    return next(new HttpError("Cancelling appointments failed", 500));
+  }
+};
+
+export { setAvailability, updateAvailability, cancelAppointments };
