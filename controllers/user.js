@@ -1,74 +1,127 @@
-import { HttpError } from "../models/error.js";  
-import { User } from "../models/user.js";        
+import { HttpError } from "../models/error.js";
+import { User } from "../models/user.js";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken"
+import jwt from "jsonwebtoken";
 
-// User Registration Controller
+// User Registration
 const register = async (req, res, next) => {
   try {
     const { name, email, password, confirmPassword, role } = req.body;
-    if (!name || !email || !password || !role) {
+
+    if (!name || !email || !password || !confirmPassword || !role) {
       return next(new HttpError("Fill in all the fields", 422));
     }
 
-    const newEmail = email.toLowerCase();
-    const emailExists = await User.findOne({ email: newEmail });
-    if (emailExists) {
-      return next(new HttpError("Email already exists.", 422));
+    if (!["professor", "student"].includes(role)) {
+      return next(new HttpError("Invalid user role", 422));
     }
-    if (password.trim().length < 3) {
-      return next(new HttpError("Password should be greater than 3 characters", 422));
+
+    if (password.length < 8) {
+      return next(new HttpError("Password must contain at least 8 characters", 422));
     }
+
     if (password !== confirmPassword) {
       return next(new HttpError("Passwords do not match", 422));
     }
 
-    const salt = await bcrypt.genSalt(11);  // 11 rounds are good and protects against attacks
-    const hashedPassword = await bcrypt.hash(password, salt);
-    const newUser = await User.create({ name, email: newEmail, password: hashedPassword, role });
-    res.status(201).json({ newUser });
+    const newEmail = email.trim().toLowerCase();
+
+    const emailExists = await User.findOne({ email: newEmail });
+
+    if (emailExists) {
+      return next(new HttpError("Email already exists", 409));
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 11);
+
+    const newUser = await User.create({
+      name: name.trim(),
+      email: newEmail,
+      password: hashedPassword,
+      role
+    });
+
+    res.status(201).json({
+      message: "Registration successful",
+      user: {
+        id: newUser._id,
+        name: newUser.name,
+        email: newUser.email,
+        role: newUser.role
+      }
+    });
+
   } catch (error) {
-    return next(new HttpError("User Registration Failed", 422));
+    console.error("Registration error:", error);
+    return next(new HttpError("User registration failed", 500));
   }
 };
-const login = async(req,res,next) => {
+
+// User Login
+const login = async (req, res, next) => {
   try {
-    const {email,password} = req.body;
-    if(!email || !password) {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
       return next(new HttpError("Fill in all fields", 422));
+    }
 
-    }
-    const newEmail = email.toLowerCase();
-    const user = await User.findOne({email: newEmail});
-    if(!user) {
-      return next(new HttpError("Invalid Credentials", 422));
-    }
-    const comparePassword = await bcrypt.compare(password,user.password);
-    // user.password is the hashed password from database
-    if(!comparePassword) {
-      return next(new HttpError("Invalid Password", 422));
-    }
-    const {_id: id, name, role} = user;
-    // a token requires a payload to work
-     const token = jwt.sign({id, name, role}, process.env.JWT_SECRET, {expiresIn: "2d"});
-     res.status(200).json({token,id,name, role})
+    const newEmail = email.trim().toLowerCase();
 
-  } catch(error) {
-    return next(new HttpError(error));
+    const user = await User.findOne({ email: newEmail });
+
+    if (!user) {
+      return next(new HttpError("Invalid credentials", 401));
+    }
+
+    const comparePassword = await bcrypt.compare(password, user.password);
+
+    if (!comparePassword) {
+      return next(new HttpError("Invalid credentials", 401));
+    }
+
+    const { _id: id, name, role } = user;
+
+    const token = jwt.sign(
+      { id: id.toString(), name, role },
+      process.env.JWT_SECRET,
+      { expiresIn: "2d" }
+    );
+
+    res.status(200).json({
+      token,
+      id,
+      name,
+      role
+    });
+
+  } catch (error) {
+    console.error("Login error:", error);
+    return next(new HttpError("Login failed", 500));
   }
-}
-const getUserProfile = async(req,res,next) => {
+};
+
+// Get User Profile
+const getUserProfile = async (req, res, next) => {
   try {
-   // extracting the id
-    const {id} = req.params;
-    const user = await User.findById(id).select('-password'); // don't send the password back
-    if(!user) {
-     return next(new HttpError("User not found", 422));
-    }
-res.status(200).json(user);
-} catch(error) {
- return next(new HttpError(error));
-  }
-}
+    const { id } = req.params;
 
-export { register, login , getUserProfile};  
+    if (req.user.id !== id) {
+      return next(new HttpError("Access denied", 403));
+    }
+
+    const user = await User.findById(id).select("-password");
+
+    if (!user) {
+      return next(new HttpError("User not found", 404));
+    }
+
+    res.status(200).json(user);
+
+  } catch (error) {
+    console.error("Profile error:", error);
+    return next(new HttpError("Failed to retrieve user profile", 500));
+  }
+};
+
+export { register, login, getUserProfile };
