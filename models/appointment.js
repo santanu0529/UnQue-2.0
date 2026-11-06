@@ -88,7 +88,7 @@ const getAppointmentsByStudent = async (studentId) => {
   const result = await docClient.send(
     new QueryCommand({
       TableName: TABLE_NAME,
-      IndexName: "StudentAppointmentsIndex",
+      IndexName: "StudentAppointmentIndex",
       KeyConditionExpression:
         "GSI1PK = :student AND begins_with(GSI1SK, :prefix)",
       ExpressionAttributeValues: {

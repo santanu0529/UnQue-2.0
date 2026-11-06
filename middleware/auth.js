@@ -9,11 +9,22 @@ const authMiddleware = (req, res, next) => {
     return next(new HttpError("Unauthorized: No token provided", 401));
   }
 
+  if (!process.env.JWT_SECRET) {
+    return next(new HttpError("Server authentication configuration error", 500));
+  }
+
   const token = authorization.split(" ")[1];
 
   jwt.verify(token, process.env.JWT_SECRET, (err, info) => {
-    if (err) {
+    if (err || !info || typeof info !== "object") {
       return next(new HttpError("Unauthorized: Invalid token", 401));
+    }
+
+    if (
+      !info.id ||
+      !["student", "professor"].includes(info.role)
+    ) {
+      return next(new HttpError("Unauthorized: Invalid token payload", 401));
     }
 
     req.user = info;

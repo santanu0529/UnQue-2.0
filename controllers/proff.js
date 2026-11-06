@@ -11,13 +11,21 @@ import {
   getAppointmentsByProfessor,
 } from "../models/appointment.js";
 
-import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  UpdateCommand,
+  DeleteCommand,
+  TransactWriteCommand,
+} from "@aws-sdk/lib-dynamodb";
+
 import { docClient } from "../config/dynamodb.js";
 
 const APPOINTMENTS_TABLE =
   process.env.DYNAMODB_APPOINTMENTS_TABLE || "UnQueAppointments";
 
-// Add professor availability
+// ==========================================
+// 1. Add professor availability
+// ==========================================
+
 const setAvailability = async (req, res, next) => {
   try {
     const { startTime, endTime } = req.body;
@@ -33,7 +41,9 @@ const setAvailability = async (req, res, next) => {
       isNaN(end.getTime()) ||
       start >= end
     ) {
-      return next(new HttpError("Invalid start or end time", 400));
+      return next(
+        new HttpError("Invalid start or end time", 400)
+      );
     }
 
     const existingSlots =
@@ -61,17 +71,25 @@ const setAvailability = async (req, res, next) => {
       endTime: end,
     });
 
-    res.status(201).json({
+    return res.status(201).json({
+      success: true,
       message: "Availability added successfully",
       availability,
     });
+
   } catch (error) {
     console.error("Set availability error:", error);
-    return next(new HttpError("Adding availability failed", 500));
+
+    return next(
+      new HttpError("Adding availability failed", 500)
+    );
   }
 };
 
-// Update an existing free availability slot
+// ==========================================
+// 2. Update an existing availability slot
+// ==========================================
+
 const updateAvailabilitySlot = async (req, res, next) => {
   try {
     const { availabilityId } = req.params;
@@ -95,18 +113,24 @@ const updateAvailabilitySlot = async (req, res, next) => {
       isNaN(end.getTime()) ||
       start >= end
     ) {
-      return next(new HttpError("Invalid start or end time", 400));
+      return next(
+        new HttpError("Invalid start or end time", 400)
+      );
     }
 
+    // Verify that the slot belongs to this professor
     const slot = await getAvailabilityById(
       professorId,
       availabilityId
     );
 
     if (!slot) {
-      return next(new HttpError("Availability slot not found", 404));
+      return next(
+        new HttpError("Availability slot not found", 404)
+      );
     }
 
+    // Prevent updating a slot containing a booked appointment
     const appointments =
       await getAppointmentsByProfessor(professorId);
 
@@ -126,6 +150,7 @@ const updateAvailabilitySlot = async (req, res, next) => {
       );
     }
 
+    // Prevent overlapping with other availability slots
     const existingSlots =
       await getAvailabilityByProfessor(professorId);
 
@@ -156,26 +181,34 @@ const updateAvailabilitySlot = async (req, res, next) => {
       endTime: end,
     });
 
-    res.status(200).json({
+    return res.status(200).json({
+      success: true,
       message: "Availability updated successfully",
       availability,
     });
+
   } catch (error) {
     console.error("Update availability error:", error);
+
     return next(
       new HttpError("Updating availability failed", 500)
     );
   }
 };
 
-// Cancel booked appointments between a professor and student
+// ==========================================
+// 3. Cancel booked appointments
+// ==========================================
+
 const cancelAppointments = async (req, res, next) => {
   try {
     const { studentId } = req.params;
     const professorId = req.user.id;
 
     if (!studentId) {
-      return next(new HttpError("Student ID is required", 400));
+      return next(
+        new HttpError("Student ID is required", 400)
+      );
     }
 
     const appointments =
@@ -193,54 +226,74 @@ const cancelAppointments = async (req, res, next) => {
       );
     }
 
+    let cancelledCount = 0;
+
     for (const appointment of studentAppointments) {
+      const now = new Date().toISOString();
+
+      // Atomically cancel the appointment and release its booking lock
       await docClient.send(
-        new UpdateCommand({
-          TableName: APPOINTMENTS_TABLE,
-          Key: {
-            PK: appointment.PK,
-            SK: appointment.SK,
-          },
-          UpdateExpression:
-            "SET #status = :cancelled, updatedAt = :updated",
-          ExpressionAttributeNames: {
-            "#status": "status",
-          },
-          ExpressionAttributeValues: {
-            ":cancelled": "cancelled",
-            ":updated": new Date().toISOString(),
-          },
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Update: {
+                TableName: APPOINTMENTS_TABLE,
+                Key: {
+                  PK: appointment.PK,
+                  SK: appointment.SK,
+                },
+                UpdateExpression:
+                  "SET #status = :cancelled, updatedAt = :updated",
+                ConditionExpression: "#status = :booked",
+                ExpressionAttributeNames: {
+                  "#status": "status",
+                },
+                ExpressionAttributeValues: {
+                  ":cancelled": "cancelled",
+                  ":booked": "booked",
+                  ":updated": now,
+                },
+              },
+            },
+            {
+              Delete: {
+                TableName: APPOINTMENTS_TABLE,
+                Key: {
+                  PK: appointment.PK,
+                  SK: `LOCK#${new Date(appointment.time).toISOString()}`,
+                },
+                ConditionExpression: "attribute_exists(PK)",
+              },
+            },
+          ],
         })
       );
 
-      // Release the professor's time so it can be booked again.
-      // The appointment record itself is retained as history.
-      const { DeleteCommand } = await import(
-        "@aws-sdk/lib-dynamodb"
-      );
-
-      await docClient.send(
-        new DeleteCommand({
-          TableName: APPOINTMENTS_TABLE,
-          Key: {
-            PK: appointment.PK,
-            SK: `LOCK#${new Date(appointment.time).toISOString()}`,
-          },
-        })
-      );
+      cancelledCount++;
     }
 
-    res.status(200).json({
+    return res.status(200).json({
+      success: true,
       message: "Appointments cancelled successfully",
-      cancelledCount: studentAppointments.length,
+      cancelledCount,
     });
+
   } catch (error) {
-    console.error("Cancel appointments error:", error);
+    console.error(
+      "Cancel appointments error:",
+      error.name,
+      error.message
+    );
+
     return next(
       new HttpError("Cancelling appointments failed", 500)
     );
   }
 };
+
+// ==========================================
+// EXPORT CONTROLLERS
+// ==========================================
 
 export {
   setAvailability,
