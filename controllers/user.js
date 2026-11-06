@@ -1,5 +1,10 @@
 import { HttpError } from "../models/error.js";
-import { User } from "../models/user.js";
+import {
+  createUser,
+  getUserByEmail,
+  getUserById,
+} from "../models/user.js";
+
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
@@ -17,7 +22,9 @@ const register = async (req, res, next) => {
     }
 
     if (password.length < 8) {
-      return next(new HttpError("Password must contain at least 8 characters", 422));
+      return next(
+        new HttpError("Password must contain at least 8 characters", 422)
+      );
     }
 
     if (password !== confirmPassword) {
@@ -26,29 +33,38 @@ const register = async (req, res, next) => {
 
     const newEmail = email.trim().toLowerCase();
 
-    const emailExists = await User.findOne({ email: newEmail });
+    const existingUser = await getUserByEmail(newEmail);
 
-    if (emailExists) {
+    if (existingUser) {
       return next(new HttpError("Email already exists", 409));
     }
 
     const hashedPassword = await bcrypt.hash(password, 11);
 
-    const newUser = await User.create({
-      name: name.trim(),
-      email: newEmail,
-      password: hashedPassword,
-      role
-    });
+    let newUser;
+
+    try {
+      newUser = await createUser({
+        name: name.trim(),
+        email: newEmail,
+        password: hashedPassword,
+        role,
+      });
+    } catch (error) {
+      if (error.name === "ConditionalCheckFailedException") {
+        return next(new HttpError("Email already exists", 409));
+      }
+      throw error;
+    }
 
     res.status(201).json({
       message: "Registration successful",
       user: {
-        id: newUser._id,
+        id: newUser.userId,
         name: newUser.name,
         email: newUser.email,
-        role: newUser.role
-      }
+        role: newUser.role,
+      },
     });
 
   } catch (error) {
@@ -68,7 +84,7 @@ const login = async (req, res, next) => {
 
     const newEmail = email.trim().toLowerCase();
 
-    const user = await User.findOne({ email: newEmail });
+    const user = await getUserByEmail(newEmail);
 
     if (!user) {
       return next(new HttpError("Invalid credentials", 401));
@@ -80,10 +96,10 @@ const login = async (req, res, next) => {
       return next(new HttpError("Invalid credentials", 401));
     }
 
-    const { _id: id, name, role } = user;
+    const { userId: id, name, role } = user;
 
     const token = jwt.sign(
-      { id: id.toString(), name, role },
+      { id, name, role },
       process.env.JWT_SECRET,
       { expiresIn: "2d" }
     );
@@ -92,7 +108,7 @@ const login = async (req, res, next) => {
       token,
       id,
       name,
-      role
+      role,
     });
 
   } catch (error) {
@@ -110,13 +126,15 @@ const getUserProfile = async (req, res, next) => {
       return next(new HttpError("Access denied", 403));
     }
 
-    const user = await User.findById(id).select("-password");
+    const user = await getUserById(id);
 
     if (!user) {
       return next(new HttpError("User not found", 404));
     }
 
-    res.status(200).json(user);
+    const { password, ...safeUser } = user;
+
+    res.status(200).json(safeUser);
 
   } catch (error) {
     console.error("Profile error:", error);

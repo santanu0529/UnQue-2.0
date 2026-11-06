@@ -1,8 +1,21 @@
 import { HttpError } from "../models/error.js";
-import { Availability } from "../models/availability.js";
-import { Appointment } from "../models/appointment.js";
-import moment from "moment";
-import mongoose from "mongoose";
+
+import {
+  createAvailability,
+  getAvailabilityByProfessor,
+  getAvailabilityById,
+  updateAvailability,
+} from "../models/availability.js";
+
+import {
+  getAppointmentsByProfessor,
+} from "../models/appointment.js";
+
+import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { docClient } from "../config/dynamodb.js";
+
+const APPOINTMENTS_TABLE =
+  process.env.DYNAMODB_APPOINTMENTS_TABLE || "UnQueAppointments";
 
 // Add professor availability
 const setAvailability = async (req, res, next) => {
@@ -10,142 +23,227 @@ const setAvailability = async (req, res, next) => {
     const { startTime, endTime } = req.body;
     const professorId = req.user.id;
 
-    if (!mongoose.Types.ObjectId.isValid(professorId)) {
-      return next(new HttpError("Invalid professor ID", 400));
-    }
-
     const start = new Date(startTime);
     const end = new Date(endTime);
 
-    if (!startTime || !endTime || isNaN(start) || isNaN(end) || start >= end) {
+    if (
+      !startTime ||
+      !endTime ||
+      isNaN(start.getTime()) ||
+      isNaN(end.getTime()) ||
+      start >= end
+    ) {
       return next(new HttpError("Invalid start or end time", 400));
     }
 
-    const overlap = await Availability.findOne({
-      professorId,
-      startTime: { $lt: end },
-      endTime: { $gt: start }
+    const existingSlots =
+      await getAvailabilityByProfessor(professorId);
+
+    const overlap = existingSlots.some((slot) => {
+      const slotStart = new Date(slot.startTime);
+      const slotEnd = new Date(slot.endTime);
+
+      return start < slotEnd && end > slotStart;
     });
 
     if (overlap) {
-      return next(new HttpError("This availability overlaps an existing slot", 400));
+      return next(
+        new HttpError(
+          "This availability overlaps an existing slot",
+          400
+        )
+      );
     }
 
-    const availability = await Availability.create({
+    const availability = await createAvailability({
       professorId,
       startTime: start,
-      endTime: end
+      endTime: end,
     });
 
     res.status(201).json({
       message: "Availability added successfully",
-      availability
+      availability,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Set availability error:", error);
     return next(new HttpError("Adding availability failed", 500));
   }
 };
 
 // Update an existing free availability slot
-const updateAvailability = async (req, res, next) => {
+const updateAvailabilitySlot = async (req, res, next) => {
   try {
     const { availabilityId } = req.params;
     const { startTime, endTime } = req.body;
     const professorId = req.user.id;
 
-    if (!mongoose.Types.ObjectId.isValid(availabilityId)) {
-      return next(new HttpError("Invalid availability ID", 400));
-    }
-
-    if (!startTime || !endTime) {
-      return next(new HttpError("Start time and end time are required", 400));
+    if (!availabilityId || !startTime || !endTime) {
+      return next(
+        new HttpError(
+          "Availability ID, start time and end time are required",
+          400
+        )
+      );
     }
 
     const start = new Date(startTime);
     const end = new Date(endTime);
 
-    if (isNaN(start) || isNaN(end) || start >= end) {
+    if (
+      isNaN(start.getTime()) ||
+      isNaN(end.getTime()) ||
+      start >= end
+    ) {
       return next(new HttpError("Invalid start or end time", 400));
     }
 
-    const slot = await Availability.findOne({
-      _id: availabilityId,
-      professorId
-    });
+    const slot = await getAvailabilityById(
+      professorId,
+      availabilityId
+    );
 
     if (!slot) {
       return next(new HttpError("Availability slot not found", 404));
     }
 
-    // Do not update a slot if it contains an existing appointment
-    const bookedAppointment = await Appointment.findOne({
-      professorId,
-      time: { $gte: slot.startTime, $lt: slot.endTime },
-      status: "booked"
-    });
+    const appointments =
+      await getAppointmentsByProfessor(professorId);
+
+    const bookedAppointment = appointments.find(
+      (appointment) =>
+        appointment.status === "booked" &&
+        new Date(appointment.time) >= new Date(slot.startTime) &&
+        new Date(appointment.time) < new Date(slot.endTime)
+    );
 
     if (bookedAppointment) {
-      return next(new HttpError("Cannot update a slot that has a booked appointment", 400));
+      return next(
+        new HttpError(
+          "Cannot update a slot that has a booked appointment",
+          400
+        )
+      );
     }
 
-    // Check overlap with other availability slots
-    const overlap = await Availability.findOne({
-      professorId,
-      _id: { $ne: availabilityId },
-      startTime: { $lt: end },
-      endTime: { $gt: start }
+    const existingSlots =
+      await getAvailabilityByProfessor(professorId);
+
+    const overlap = existingSlots.some((otherSlot) => {
+      if (otherSlot.availabilityId === availabilityId) {
+        return false;
+      }
+
+      return (
+        start < new Date(otherSlot.endTime) &&
+        end > new Date(otherSlot.startTime)
+      );
     });
 
     if (overlap) {
-      return next(new HttpError("Updated time overlaps another availability slot", 400));
+      return next(
+        new HttpError(
+          "Updated time overlaps another availability slot",
+          400
+        )
+      );
     }
 
-    slot.startTime = start;
-    slot.endTime = end;
-    await slot.save();
+    const availability = await updateAvailability({
+      professorId,
+      availabilityId,
+      startTime: start,
+      endTime: end,
+    });
 
     res.status(200).json({
       message: "Availability updated successfully",
-      availability: slot
+      availability,
     });
   } catch (error) {
-    console.error(error);
-    return next(new HttpError("Updating availability failed", 500));
+    console.error("Update availability error:", error);
+    return next(
+      new HttpError("Updating availability failed", 500)
+    );
   }
 };
 
-// Cancel appointments between a professor and student
+// Cancel booked appointments between a professor and student
 const cancelAppointments = async (req, res, next) => {
   try {
     const { studentId } = req.params;
     const professorId = req.user.id;
 
-    if (!studentId || !mongoose.Types.ObjectId.isValid(studentId)) {
-      return next(new HttpError("Invalid or missing student ID", 400));
+    if (!studentId) {
+      return next(new HttpError("Student ID is required", 400));
     }
 
-    const result = await Appointment.updateMany(
-      {
-        studentId,
-        professorId,
-        status: "booked"
-      },
-      { $set: { status: "cancelled" } }
+    const appointments =
+      await getAppointmentsByProfessor(professorId);
+
+    const studentAppointments = appointments.filter(
+      (appointment) =>
+        appointment.studentId === studentId &&
+        appointment.status === "booked"
     );
 
-    if (result.modifiedCount === 0) {
-      return next(new HttpError("No appointments found to cancel", 404));
+    if (studentAppointments.length === 0) {
+      return next(
+        new HttpError("No appointments found to cancel", 404)
+      );
+    }
+
+    for (const appointment of studentAppointments) {
+      await docClient.send(
+        new UpdateCommand({
+          TableName: APPOINTMENTS_TABLE,
+          Key: {
+            PK: appointment.PK,
+            SK: appointment.SK,
+          },
+          UpdateExpression:
+            "SET #status = :cancelled, updatedAt = :updated",
+          ExpressionAttributeNames: {
+            "#status": "status",
+          },
+          ExpressionAttributeValues: {
+            ":cancelled": "cancelled",
+            ":updated": new Date().toISOString(),
+          },
+        })
+      );
+
+      // Release the professor's time so it can be booked again.
+      // The appointment record itself is retained as history.
+      const { DeleteCommand } = await import(
+        "@aws-sdk/lib-dynamodb"
+      );
+
+      await docClient.send(
+        new DeleteCommand({
+          TableName: APPOINTMENTS_TABLE,
+          Key: {
+            PK: appointment.PK,
+            SK: `LOCK#${new Date(appointment.time).toISOString()}`,
+          },
+        })
+      );
     }
 
     res.status(200).json({
       message: "Appointments cancelled successfully",
-      cancelledCount: result.modifiedCount
+      cancelledCount: studentAppointments.length,
     });
   } catch (error) {
-    console.error(error);
-    return next(new HttpError("Cancelling appointments failed", 500));
+    console.error("Cancel appointments error:", error);
+    return next(
+      new HttpError("Cancelling appointments failed", 500)
+    );
   }
 };
 
-export { setAvailability, updateAvailability, cancelAppointments };
+export {
+  setAvailability,
+  updateAvailabilitySlot as updateAvailability,
+  cancelAppointments,
+};
