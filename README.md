@@ -138,7 +138,7 @@ automatically.
 
 ## Demo video
 
-`<ADD LINK TO THE DEMO VIDEO>`
+https://drive.google.com/file/d/1Ur7TZ8-35rD2lr5igxB7wkrQG2zYYK0K/view?usp=drive_link
 
 ## Security notes
 
